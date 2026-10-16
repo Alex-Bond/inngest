@@ -1,7 +1,7 @@
 # trustis inngest build
 
 Patched engine image `trustis/inngest:v1.46.0-trustis.1`: inngest v1.46.0 plus the
-Connect no-healthy-connection halt (branch `trustis/connect-no-worker-halt`, refs
+Connect no-healthy-connection halt (branch `fix/connect-no-worker-halt`, refs
 inngest/inngest#5022). Local-only build tooling; excluded via `.git/info/exclude`.
 
 ## Build
