@@ -1,0 +1,13 @@
+# Builds the dev-server dashboard UI exactly like `make build-ui` (goreleaser pre-hook).
+# Context: a directory holding ui/ (no node_modules) and pkg/coreapi/**/*.graphql (codegen schema).
+FROM node:22.16.0-bookworm-slim AS ui
+RUN corepack enable && corepack prepare pnpm@10.18.2 --activate
+WORKDIR /src
+COPY . ./
+RUN cd ui/apps/dev-server-ui && pnpm install --frozen-lockfile
+# The prerender step fetches 127.0.0.1; without this the vite preview server binds ::1 and the build fails.
+ENV NODE_OPTIONS=--dns-result-order=ipv4first
+RUN cd ui/apps/dev-server-ui && pnpm build
+
+FROM scratch
+COPY --from=ui /src/ui/apps/dev-server-ui/dist/ /
