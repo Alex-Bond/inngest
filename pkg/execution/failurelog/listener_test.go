@@ -51,7 +51,7 @@ func TestOnFunctionFinishedLogsFailureOnce(t *testing.T) {
 		Err:        &errStr,
 		StatusCode: 500,
 		Step:       inngest.Step{Name: "send"},
-		UserError:  &statev1.UserError{Name: "Error", Message: "boom", Stack: "Error: boom\n    at send"},
+		Output:     json.RawMessage(`{"name":"Error","message":"boom","stack":"Error: boom\n    at send"}`),
 	}
 
 	listener.OnFunctionFinished(context.Background(), md, item, evts, resp)
@@ -80,6 +80,25 @@ func TestOnFunctionFinishedLogsFailureOnce(t *testing.T) {
 	require.Equal(t, "Error", got["error_name"])
 	require.Equal(t, "boom", got["error_message"])
 	require.Equal(t, "Error: boom\n    at send", got["error_stack"])
+}
+
+func TestOnFunctionFinishedWithoutSDKErrorFallsBackToErr(t *testing.T) {
+	listener, buf := newTestListener()
+	errStr := "Unable to reach SDK URL"
+
+	listener.OnFunctionFinished(
+		context.Background(),
+		newTestMetadata(),
+		queue.Item{},
+		nil,
+		statev1.DriverResponse{Err: &errStr},
+	)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &got))
+	require.Equal(t, errStr, got["error"])
+	require.Equal(t, "Error", got["error_name"])
+	require.Equal(t, errStr, got["error_message"])
 }
 
 func TestOnFunctionFinishedIgnoresSuccess(t *testing.T) {

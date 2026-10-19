@@ -42,7 +42,9 @@ func (l *Listener) OnFunctionFinished(
 		return
 	}
 
-	attrs := []any{
+	// StandardError reads the SDK's error from the output, which is where a function-level failure carries it.
+	se := resp.StandardError()
+	l.log.ErrorContext(ctx, "function run failed",
 		"inngest_event", FunctionFailedEvent,
 		"run_id", md.ID.RunID.String(),
 		"function_id", md.ID.FunctionID.String(),
@@ -57,16 +59,10 @@ func (l *Listener) OnFunctionFinished(
 		"status_code", resp.StatusCode,
 		"step_name", resp.Step.Name,
 		"no_retry", resp.NoRetry,
-	}
-	if resp.UserError != nil {
-		attrs = append(attrs,
-			"error_name", resp.UserError.Name,
-			"error_message", resp.UserError.Message,
-			"error_stack", resp.UserError.Stack,
-		)
-	}
-
-	l.log.ErrorContext(ctx, "function run failed", attrs...)
+		"error_name", se.Name,
+		"error_message", se.Message,
+		"error_stack", se.Stack,
+	)
 }
 
 // eventName reads the name of the first triggering event; an unparseable event yields "".
