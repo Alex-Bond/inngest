@@ -55,6 +55,7 @@ import (
 	"github.com/inngest/inngest/pkg/execution/driver/httpv2"
 	"github.com/inngest/inngest/pkg/execution/exechttp"
 	"github.com/inngest/inngest/pkg/execution/executor"
+	"github.com/inngest/inngest/pkg/execution/failurelog"
 	"github.com/inngest/inngest/pkg/execution/history"
 	"github.com/inngest/inngest/pkg/execution/pauses"
 	"github.com/inngest/inngest/pkg/execution/queue"
@@ -555,6 +556,7 @@ func start(ctx context.Context, opts StartOpts) error {
 					RunsRecorded: opts.EventStream.durable(),
 				},
 				run.NewTraceLifecycleListener(nil),
+				failurelog.NewListener(l),
 			}, metrics.NewLifecycleListeners()...)...,
 		),
 		executor.WithEventLifecycleListeners(execution.NoopEventLifecycleListener{}),
