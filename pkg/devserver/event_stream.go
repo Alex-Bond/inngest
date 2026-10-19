@@ -13,6 +13,9 @@ const (
 	DefaultEventStreamMaxMemoryPercent = 70
 	DefaultEventStreamDrainSeconds     = 45
 	DefaultEventStreamMaxRequestBytes  = 64 << 20
+
+	// durableDedupTTL outlives the stream's replay horizon so redeliveries still hit dedup keys.
+	durableDedupTTL = 2 * time.Hour
 )
 
 // EventStreamOpts selects and tunes the event stream between the event API and

@@ -370,9 +370,14 @@ func start(ctx context.Context, opts StartOpts) error {
 		return fmt.Errorf("could not create constraint API: %w", err)
 	}
 
+	queueIdempotencyTTL := time.Hour
+	if opts.EventStream.durable() {
+		queueIdempotencyTTL = durableDedupTTL
+	}
+
 	queueOpts := []queue.QueueOpt{
 		queue.WithRunMode(runMode),
-		queue.WithIdempotencyTTL(time.Hour),
+		queue.WithIdempotencyTTL(queueIdempotencyTTL),
 		queue.WithNumWorkers(int32(opts.QueueWorkers)),
 		queue.WithPollTick(opts.Tick),
 		queue.WithShadowPollTick(2 * opts.Tick),
@@ -436,6 +441,9 @@ func start(ctx context.Context, opts StartOpts) error {
 	// schedule-batch partition.
 	splitBatchPartitionByFunction := os.Getenv("EXPERIMENTAL_SPLIT_BATCH_PARTITION_BY_FUNCTION") == "true"
 	batchOpts := []batch.RedisBatchManagerOpt{batch.WithLogger(l)}
+	if opts.EventStream.durable() {
+		batchOpts = append(batchOpts, batch.WithRedisBatchIdempotenceSetTTL(int64(durableDedupTTL.Seconds())))
+	}
 	if splitBatchPartitionByFunction {
 		batchOpts = append(batchOpts, batch.WithSplitBatchPartitionByFunction(func(_ context.Context, _ uuid.UUID) bool {
 			return true
