@@ -818,10 +818,11 @@ func start(ctx context.Context, opts StartOpts) error {
 	}
 
 	ds.Apiservice = api.NewService(api.APIServiceOptions{
-		Config:         ds.Opts.Config,
-		Mounts:         mounts,
-		LocalEventKeys: opts.EventKeys,
-		Logger:         l,
+		Config:          ds.Opts.Config,
+		Mounts:          mounts,
+		LocalEventKeys:  opts.EventKeys,
+		MaxRequestBytes: opts.EventStream.MaxRequestBytes,
+		Logger:          l,
 	})
 
 	services = append(services, ds, runner, executorSvc, ds.Apiservice, connGateway)
