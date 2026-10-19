@@ -198,7 +198,14 @@ func (s *svc) Run(ctx context.Context) error {
 	// This is necessary for batch buffering - when Append() blocks waiting for
 	// the buffer to fill/flush, we need other events to be processed concurrently
 	// to fill the buffer.
-	err := s.pubsub.SubscribeN(ctx, s.config.EventStream.Service.TopicName(), s.handleMessage, 1000)
+	concurrency := int64(1000)
+	if rs, ok := s.config.EventStream.Service.Concrete.(*config.RedisMessaging); ok {
+		concurrency = rs.Concurrency
+		if concurrency <= 0 {
+			concurrency = pubsub.DefaultStreamConcurrency
+		}
+	}
+	err := s.pubsub.SubscribeN(ctx, s.config.EventStream.Service.TopicName(), s.handleMessage, concurrency)
 	if err != nil {
 		return err
 	}

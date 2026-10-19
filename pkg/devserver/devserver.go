@@ -158,6 +158,9 @@ type StartOpts struct {
 	// SQLiteDir specifies where SQLite files should be stored
 	SQLiteDir string `json:"sqlite_dir"`
 
+	// EventStream selects the event stream; the zero value is in-memory.
+	EventStream EventStreamOpts `json:"-"`
+
 	// Debug API
 	DebugAPIPort int `json:"debugAPIPort"`
 }
@@ -293,6 +296,14 @@ func start(ctx context.Context, opts StartOpts) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	streamRc, err := configureEventStream(&opts)
+	if err != nil {
+		return err
+	}
+	if streamRc != nil {
+		defer streamRc.Close()
 	}
 
 	unshardedClient := redis_state.NewUnshardedClient(unshardedRc, redis_state.StateDefaultKey, redis_state.QueueDefaultKey)

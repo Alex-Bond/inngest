@@ -26,6 +26,10 @@ func NewSubscriber(ctx context.Context, c config.MessagingService) (Subscriber, 
 }
 
 func NewPublishSubscriber(ctx context.Context, c config.MessagingService) (PublishSubscriber, error) {
+	if rc, ok := c.Concrete.(*config.RedisMessaging); ok {
+		return newRedisStream(ctx, rc)
+	}
+
 	b := &broker{
 		conf:   c,
 		topics: map[string]*pubsub.Topic{},

@@ -2,8 +2,10 @@ package start
 
 import (
 	"github.com/inngest/inngest/pkg/api"
+	"github.com/inngest/inngest/pkg/config"
 	connectgrpc "github.com/inngest/inngest/pkg/connect/grpc"
 	"github.com/inngest/inngest/pkg/devserver"
+	"github.com/inngest/inngest/pkg/pubsub"
 	"github.com/urfave/cli/v3"
 )
 
@@ -145,6 +147,44 @@ func Command() *cli.Command {
 				Category: "Advanced",
 				Name:     "no-ui",
 				Usage:    "Disable the web UI and GraphQL API endpoint",
+			},
+
+			// Event stream flags
+			&cli.StringFlag{
+				Category: "Event stream",
+				Name:     "event-stream",
+				Value:    config.MessagingInMemory,
+				Usage:    "Event stream between the event API and the runner: inmemory, or redis for a durable stream on --redis-uri",
+			},
+			&cli.IntFlag{
+				Category: "Event stream",
+				Name:     "event-stream-concurrency",
+				Value:    pubsub.DefaultStreamConcurrency,
+				Usage:    "Events handled concurrently from the redis event stream",
+			},
+			&cli.IntFlag{
+				Category: "Event stream",
+				Name:     "event-stream-max-backlog",
+				Value:    devserver.DefaultEventStreamMaxBacklog,
+				Usage:    "Reject events with 503 while the redis event stream backlog exceeds this (0 disables)",
+			},
+			&cli.IntFlag{
+				Category: "Event stream",
+				Name:     "event-stream-max-memory-percent",
+				Value:    devserver.DefaultEventStreamMaxMemoryPercent,
+				Usage:    "Reject events with 503 while redis memory use exceeds this percent of maxmemory (0 disables)",
+			},
+			&cli.IntFlag{
+				Category: "Event stream",
+				Name:     "event-stream-drain-timeout",
+				Value:    devserver.DefaultEventStreamDrainSeconds,
+				Usage:    "Seconds to wait on shutdown for in-flight events from the redis event stream",
+			},
+			&cli.IntFlag{
+				Category: "Event stream",
+				Name:     "event-stream-max-request-bytes",
+				Value:    devserver.DefaultEventStreamMaxRequestBytes,
+				Usage:    "Maximum body size of one event request with the redis event stream (0 disables)",
 			},
 		},
 	}

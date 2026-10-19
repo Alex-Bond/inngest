@@ -77,7 +77,7 @@ package config
 }
 
 // @TODO: Add custom redis driver, add Kafka.
-#MessagingService: #InmemMessaging | #NATSMessaging | #SQSMessaging | #GCPPubSubMessaging
+#MessagingService: #InmemMessaging | #NATSMessaging | #SQSMessaging | #GCPPubSubMessaging | #RedisMessaging
 
 // InmemMessaging defines configuration for an in-memory based event queue.  This is
 // only usable for single-container testing;  in-memory implementations only share
@@ -100,6 +100,14 @@ package config
 	backend: "gcp-pubsub"
 	project: string
 	topic:   string
+}
+
+// RedisMessaging defines configuration for using Redis Streams as a durable
+// backing event stream.  The Redis client is supplied at runtime.
+#RedisMessaging: {
+	backend:    "redis"
+	topic:      string
+	keyPrefix?: string
 }
 
 // SQSMessaging defines configuration for using SQS as a backing event stream.
