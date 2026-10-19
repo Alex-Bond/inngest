@@ -228,6 +228,9 @@ type InvokeFailHandlerOpts struct {
 // to be worked on *imminently* (i.e. ~now, not at some future time).
 type BatchExecOpts struct {
 	FunctionPausedAt *time.Time
+	// Replay marks a retry of an already-started batch, which may only resume
+	// its original run while that run's idempotency record can still dedupe it.
+	Replay bool
 }
 
 // FinalizePublisher is a function that handles functions finishing in the executor.

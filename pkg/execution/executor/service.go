@@ -397,10 +397,6 @@ func (s *svc) handleScheduledBatch(ctx context.Context, item queue.Item) error {
 	if err != nil {
 		return err
 	}
-	if status == enums.BatchStatusStarted.String() {
-		// batch already started, abort
-		return nil
-	}
 	if status == enums.BatchStatusAbsent.String() {
 		// just attempt clean up, don't care about the result
 		_ = s.batcher.DeleteKeys(ctx, opts.FunctionID, batchID)
@@ -420,7 +416,10 @@ func (s *svc) handleScheduledBatch(ctx context.Context, item queue.Item) error {
 		AppID:           item.Identifier.AppID,
 		FunctionID:      item.Identifier.WorkflowID,
 		FunctionVersion: fn.FunctionVersion,
-	}, nil); err != nil {
+	}, &execution.BatchExecOpts{
+		// A started batch with keys left may not have recorded its run; replay is bounded by run idempotency.
+		Replay: status == enums.BatchStatusStarted.String(),
+	}); err != nil {
 		return fmt.Errorf("could not retrieve and schedule batch items: %w", err)
 	}
 

@@ -541,9 +541,10 @@ func start(ctx context.Context, opts StartOpts) error {
 					hd,
 				),
 				Lifecycle{
-					Cqrs:       dbcqrs,
-					Pb:         pb,
-					EventTopic: opts.Config.EventStream.Service.Concrete.TopicName(),
+					Cqrs:         dbcqrs,
+					Pb:           pb,
+					EventTopic:   opts.Config.EventStream.Service.Concrete.TopicName(),
+					RunsRecorded: opts.EventStream.durable(),
 				},
 				run.NewTraceLifecycleListener(nil),
 			}, metrics.NewLifecycleListeners()...)...,
@@ -586,6 +587,10 @@ func start(ctx context.Context, opts StartOpts) error {
 		executor.WithEnableBatchingInstrumentation(func(ctx context.Context, accountID, envID uuid.UUID) (enable bool) {
 			return false
 		}),
+	}
+
+	if opts.EventStream.durable() {
+		executorOpts = append(executorOpts, executor.WithRunRecorder(newRunRecorder(dbcqrs)))
 	}
 
 	exec, err := executor.NewExecutor(executorOpts...)
