@@ -1082,7 +1082,7 @@ func (s *svc) handleCron(ctx context.Context, item queue.Item) error {
 		Timestamp: fireAt.UnixMilli(),
 	}, nil)
 
-	// publish cron event to pubsub
+	// publish cron event to pubsub on a ctx that outlives the job's
 	go func(ctx context.Context) {
 		byt, err := json.Marshal(evt)
 		if err != nil {
@@ -1101,7 +1101,7 @@ func (s *svc) handleCron(ctx context.Context, item queue.Item) error {
 		); err != nil {
 			l.Error("error publishing cron event", "error", err)
 		}
-	}(ctx)
+	}(context.WithoutCancel(ctx))
 
 	ctx, span := run.NewSpan(ctx,
 		run.WithNewRoot(),
