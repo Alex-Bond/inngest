@@ -1,0 +1,65 @@
+# Durable event stream load test; run.sh drives it.  Host ports are offset so
+# the stack can run beside a local development stack.
+name: inngest-eventstream-load
+
+services:
+  valkey:
+    image: valkey/valkey:8.1
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 2gb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "16379:6379"
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: inngest
+      POSTGRES_PASSWORD: inngest
+      POSTGRES_DB: inngest
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inngest"]
+      interval: 1s
+      retries: 30
+
+  inngest:
+    build:
+      context: ../..
+      dockerfile: tests/eventstream_load/Dockerfile
+    cpus: 1
+    command:
+      - inngest
+      - start
+      - --port
+      - "8288"
+      - --event-stream
+      - redis
+      - --redis-uri
+      - redis://valkey:6379
+      - --postgres-uri
+      - postgres://inngest:inngest@postgres:5432/inngest?sslmode=disable
+      - --signing-key
+      - 6c6f6164746573742d7369676e696e672d6b6579
+      - --event-key
+      - loadtest-event-key
+    environment:
+      LOG_HANDLER: json
+    ports:
+      - "18288:8288"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    stop_grace_period: 180s
+    depends_on:
+      valkey:
+        condition: service_started
+      postgres:
+        condition: service_healthy
