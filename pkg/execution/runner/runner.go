@@ -352,7 +352,15 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 
 	l.Info("received event")
 
-	var errs error
+	var (
+		errs  error
+		errMu sync.Mutex
+	)
+	appendErr := func(err error) {
+		errMu.Lock()
+		errs = multierror.Append(errs, err)
+		errMu.Unlock()
+	}
 	wg := &sync.WaitGroup{}
 
 	// Trigger both new functions and pauses.
@@ -361,7 +369,7 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 		defer wg.Done()
 		if err := s.functions(ctx, tracked); err != nil {
 			l.Error("error scheduling functions", "error", err)
-			errs = multierror.Append(errs, err)
+			appendErr(err)
 		}
 	}()
 
@@ -379,7 +387,7 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 				}
 
 				l.Error("error resuming function after invoke", "error", err)
-				errs = multierror.Append(errs, err)
+				appendErr(err)
 			}
 		}()
 	}
@@ -389,7 +397,7 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 		defer wg.Done()
 		if err := s.pauses(ctx, tracked); err != nil {
 			l.Error("error consuming pauses", "error", err)
-			errs = multierror.Append(errs, err)
+			appendErr(err)
 		}
 	}()
 
@@ -443,7 +451,16 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 
 	// Don't use an errgroup here as we want all errors together, vs the first
 	// non-nil error.
-	var errs error
+	// Every return waits for wg, as the event is acked on return.
+	var (
+		errs  error
+		errMu sync.Mutex
+	)
+	appendErr := func(err error) {
+		errMu.Lock()
+		errs = multierror.Append(errs, err)
+		errMu.Unlock()
+	}
 	wg := &sync.WaitGroup{}
 
 	wg.Add(1)
@@ -453,8 +470,6 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 		// Find any invoke functions specified.
 		fn, err := FindInvokedFunction(ctx, tracked, s.data)
 		if err != nil {
-			errs = multierror.Append(errs, err)
-
 			// If this errored, then we were supposed to find a function to
 			// invoke. In this case, emit a completion event with the error.
 			perr := s.executor.InvokeFailHandler(ctx, execution.InvokeFailHandlerOpts{
@@ -468,7 +483,11 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 				},
 			})
 			if perr != nil {
-				errs = multierror.Append(errs, perr)
+				appendErr(err)
+				appendErr(perr)
+			} else {
+				// The invoker was failed; a redelivery would only fail it again.
+				s.log.Warn("invoked function not found; failed the invoker", "error", err)
 			}
 		}
 		if fn != nil {
@@ -480,7 +499,7 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 					"error", err,
 					"function", fn.Name,
 				)
-				errs = multierror.Append(errs, err)
+				appendErr(err)
 			}
 		}
 	}()
@@ -488,10 +507,13 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 	// Look up all functions have a trigger that matches the event name, including wildcards.
 	fns, err := s.data.FunctionsByTrigger(ctx, evt.Name)
 	if err != nil {
-		return fmt.Errorf("error loading functions by trigger: %w", err)
+		appendErr(fmt.Errorf("error loading functions by trigger: %w", err))
+		wg.Wait()
+		return errs
 	}
 	if len(fns) == 0 {
-		return nil
+		wg.Wait()
+		return errs
 	}
 
 	s.log.Debug("scheduling functions", "len", len(fns))
@@ -538,7 +560,7 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 						"event": evtMap,
 					})
 					if evalerr != nil {
-						errs = multierror.Append(errs, evalerr)
+						appendErr(evalerr)
 						continue
 					}
 					if !ok {
@@ -555,7 +577,7 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 						"error", err,
 						"function", copied.Name,
 					)
-					errs = multierror.Append(errs, err)
+					appendErr(err)
 				}
 				return
 			}
