@@ -133,6 +133,9 @@ func (b *broker) SubscribeN(ctx context.Context, topic string, run PerformFunc, 
 	// completed.
 	var unrecoverableErr error
 
+	// Handlers get a live ctx so shutdown never cancels a half-processed event.
+	handlerCtx := context.WithoutCancel(ctx)
+
 	for {
 		// We always have to check the context err, as semaphores can be acquired and return
 		// no error after the context is cancelled.  It only errors if we're blocking and waiting
@@ -159,7 +162,7 @@ func (b *broker) SubscribeN(ctx context.Context, topic string, run PerformFunc, 
 
 			m := &Message{}
 			if err := m.Decode(msg.Body); err != nil {
-				logger.StdlibLogger(ctx).Error("error decoding pubsub message", "error", err)
+				logger.StdlibLogger(handlerCtx).Error("error decoding pubsub message", "error", err)
 
 				if msg.Nackable() {
 					msg.Nack()
@@ -170,7 +173,7 @@ func (b *broker) SubscribeN(ctx context.Context, topic string, run PerformFunc, 
 			}
 
 			// Run the message only if we've decoded items.
-			err := run(ctx, *m)
+			err := run(handlerCtx, *m)
 			if err == nil {
 				msg.Ack()
 				return
@@ -183,6 +186,8 @@ func (b *broker) SubscribeN(ctx context.Context, topic string, run PerformFunc, 
 			}
 		}(msg)
 	}
+
+	wg.Wait()
 
 	if errors.Is(unrecoverableErr, context.Canceled) {
 		// There's no need to error here, and an implicit race on sem acquisition
