@@ -6,9 +6,11 @@ import (
 	"github.com/inngest/inngest/pkg/cqrs"
 	"github.com/inngest/inngest/pkg/event"
 	"github.com/inngest/inngest/pkg/execution"
+	"github.com/inngest/inngest/pkg/execution/executor"
 	"github.com/inngest/inngest/pkg/execution/queue"
 	"github.com/inngest/inngest/pkg/execution/state/v2"
 	"github.com/inngest/inngest/pkg/pubsub"
+	"github.com/inngest/inngest/pkg/util"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -18,6 +20,9 @@ type Lifecycle struct {
 	Cqrs       cqrs.Manager
 	Pb         pubsub.Publisher
 	EventTopic string
+
+	// RunsRecorded skips the function_runs insert a RunRecorder already makes.
+	RunsRecorded bool
 }
 
 func (l Lifecycle) OnFunctionScheduled(
@@ -26,15 +31,9 @@ func (l Lifecycle) OnFunctionScheduled(
 	item queue.Item,
 	_ []event.TrackedEvent,
 ) {
-	_ = l.Cqrs.InsertFunctionRun(ctx, cqrs.FunctionRun{
-		RunID:         md.ID.RunID,
-		RunStartedAt:  ulid.Time(md.ID.RunID.Time()),
-		FunctionID:    md.ID.FunctionID,
-		EventID:       md.Config.EventID(),
-		Cron:          md.Config.CronSchedule(),
-		OriginalRunID: md.Config.OriginalRunID,
-		WorkspaceID:   md.ID.Tenant.EnvID,
-	})
+	if !l.RunsRecorded {
+		_ = l.Cqrs.InsertFunctionRun(ctx, functionRun(md))
+	}
 
 	if md.Config.BatchID != nil {
 		executedTime := ulid.Time(md.ID.RunID.Time())
@@ -53,5 +52,28 @@ func (l Lifecycle) OnFunctionScheduled(
 		if batch.IsMulti() {
 			_ = l.Cqrs.InsertEventBatch(ctx, *batch)
 		}
+	}
+}
+
+func functionRun(md state.Metadata) cqrs.FunctionRun {
+	return cqrs.FunctionRun{
+		RunID:         md.ID.RunID,
+		RunStartedAt:  ulid.Time(md.ID.RunID.Time()),
+		FunctionID:    md.ID.FunctionID,
+		EventID:       md.Config.EventID(),
+		Cron:          md.Config.CronSchedule(),
+		OriginalRunID: md.Config.OriginalRunID,
+		WorkspaceID:   md.ID.Tenant.EnvID,
+	}
+}
+
+// newRunRecorder inserts function_runs inline with scheduling so a failed insert is
+// retried with its event; the lock stops concurrent retries both passing NOT EXISTS.
+func newRunRecorder(cq cqrs.Manager) executor.RunRecorder {
+	lock := util.NewKeyedMutex()
+	return func(ctx context.Context, md state.Metadata) error {
+		unlock := lock.Lock(md.ID.RunID[:])
+		defer unlock()
+		return cq.InsertFunctionRun(ctx, functionRun(md))
 	}
 }

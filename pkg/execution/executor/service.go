@@ -397,10 +397,6 @@ func (s *svc) handleScheduledBatch(ctx context.Context, item queue.Item) error {
 	if err != nil {
 		return err
 	}
-	if status == enums.BatchStatusStarted.String() {
-		// batch already started, abort
-		return nil
-	}
 	if status == enums.BatchStatusAbsent.String() {
 		// just attempt clean up, don't care about the result
 		_ = s.batcher.DeleteKeys(ctx, opts.FunctionID, batchID)
@@ -420,7 +416,10 @@ func (s *svc) handleScheduledBatch(ctx context.Context, item queue.Item) error {
 		AppID:           item.Identifier.AppID,
 		FunctionID:      item.Identifier.WorkflowID,
 		FunctionVersion: fn.FunctionVersion,
-	}, nil); err != nil {
+	}, &execution.BatchExecOpts{
+		// A started batch with keys left may not have recorded its run; replay is bounded by run idempotency.
+		Replay: status == enums.BatchStatusStarted.String(),
+	}); err != nil {
 		return fmt.Errorf("could not retrieve and schedule batch items: %w", err)
 	}
 
@@ -1083,7 +1082,7 @@ func (s *svc) handleCron(ctx context.Context, item queue.Item) error {
 		Timestamp: fireAt.UnixMilli(),
 	}, nil)
 
-	// publish cron event to pubsub
+	// publish cron event to pubsub on a ctx that outlives the job's
 	go func(ctx context.Context) {
 		byt, err := json.Marshal(evt)
 		if err != nil {
@@ -1102,7 +1101,7 @@ func (s *svc) handleCron(ctx context.Context, item queue.Item) error {
 		); err != nil {
 			l.Error("error publishing cron event", "error", err)
 		}
-	}(ctx)
+	}(context.WithoutCancel(ctx))
 
 	ctx, span := run.NewSpan(ctx,
 		run.WithNewRoot(),

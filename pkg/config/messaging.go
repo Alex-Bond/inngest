@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/redis/rueidis"
 	"gocloud.dev/pubsub"
 )
 
@@ -17,6 +19,7 @@ const (
 	MessagingNATS      = "nats"
 	MessagingGCPPubSub = "gcp-pubsub"
 	MessagingSQS       = "aws-sqs"
+	MessagingRedis     = "redis"
 
 	URLTypePublish   URLType = "publish"
 	URLTypeSubscribe URLType = "subscribe"
@@ -79,6 +82,8 @@ func (m *MessagingService) UnmarshalJSON(byt []byte) error {
 		concrete = &GCPPubSubMessaging{}
 	case MessagingSQS:
 		concrete = &SQSMessaging{}
+	case MessagingRedis:
+		concrete = &RedisMessaging{}
 	default:
 		return fmt.Errorf("unknown messaging backend: %s", m.Backend)
 	}
@@ -188,4 +193,44 @@ func (s SQSMessaging) TopicURL(topic string, typ URLType) string {
 		url,
 		s.Region,
 	)
+}
+
+// RedisMessaging configures a durable event stream on Redis Streams.  Zero
+// values select the defaults documented on each field.
+type RedisMessaging struct {
+	Topic string
+	// KeyPrefix prefixes the stream keys; defaults to "inngest:eventstream".
+	KeyPrefix string
+	// Client is dedicated so blocking reads never share queue or state connections.
+	Client rueidis.Client `json:"-"`
+	// Consumer names this process in the consumer group; defaults to the hostname.
+	Consumer string
+	// Concurrency bounds in-flight handlers; defaults to 200.
+	Concurrency int64
+	// MinIdle is how long a pending entry must be idle before it is reclaimed; defaults to 5m.
+	MinIdle time.Duration
+	// ReclaimInterval is how often idle pending entries are reclaimed; defaults to 30s.
+	ReclaimInterval time.Duration
+	// DrainTimeout bounds the shutdown wait for in-flight handlers; defaults to 45s.
+	DrainTimeout time.Duration
+	// MaxDeliveries dead-letters an entry delivered this many times; defaults to 10.
+	MaxDeliveries int64
+	// MaxReplayAge dead-letters older redeliveries, whose dedup keys may be gone; defaults to 55m.
+	MaxReplayAge time.Duration
+	// MaxBacklog rejects external events while the backlog exceeds it; 0 disables.
+	MaxBacklog int64
+	// MaxMemoryRatio rejects external events above this used/max memory ratio; 0 disables.
+	MaxMemoryRatio float64
+}
+
+func (r RedisMessaging) Backend() string {
+	return MessagingRedis
+}
+
+func (r RedisMessaging) TopicName() string {
+	return r.Topic
+}
+
+func (r RedisMessaging) TopicURL(topic string, typ URLType) string {
+	return fmt.Sprintf("redisstream://%s", topic)
 }

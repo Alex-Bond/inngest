@@ -158,6 +158,9 @@ type StartOpts struct {
 	// SQLiteDir specifies where SQLite files should be stored
 	SQLiteDir string `json:"sqlite_dir"`
 
+	// EventStream selects the event stream; the zero value is in-memory.
+	EventStream EventStreamOpts `json:"-"`
+
 	// Debug API
 	DebugAPIPort int `json:"debugAPIPort"`
 }
@@ -295,6 +298,14 @@ func start(ctx context.Context, opts StartOpts) error {
 		}
 	}
 
+	streamRc, err := configureEventStream(&opts)
+	if err != nil {
+		return err
+	}
+	if streamRc != nil {
+		defer streamRc.Close()
+	}
+
 	unshardedClient := redis_state.NewUnshardedClient(unshardedRc, redis_state.StateDefaultKey, redis_state.QueueDefaultKey)
 	shardedClient := redis_state.NewShardedClient(redis_state.ShardedClientOpts{
 		UnshardedClient:        unshardedClient,
@@ -359,9 +370,14 @@ func start(ctx context.Context, opts StartOpts) error {
 		return fmt.Errorf("could not create constraint API: %w", err)
 	}
 
+	queueIdempotencyTTL := time.Hour
+	if opts.EventStream.durable() {
+		queueIdempotencyTTL = durableDedupTTL
+	}
+
 	queueOpts := []queue.QueueOpt{
 		queue.WithRunMode(runMode),
-		queue.WithIdempotencyTTL(time.Hour),
+		queue.WithIdempotencyTTL(queueIdempotencyTTL),
 		queue.WithNumWorkers(int32(opts.QueueWorkers)),
 		queue.WithPollTick(opts.Tick),
 		queue.WithShadowPollTick(2 * opts.Tick),
@@ -425,6 +441,9 @@ func start(ctx context.Context, opts StartOpts) error {
 	// schedule-batch partition.
 	splitBatchPartitionByFunction := os.Getenv("EXPERIMENTAL_SPLIT_BATCH_PARTITION_BY_FUNCTION") == "true"
 	batchOpts := []batch.RedisBatchManagerOpt{batch.WithLogger(l)}
+	if opts.EventStream.durable() {
+		batchOpts = append(batchOpts, batch.WithRedisBatchIdempotenceSetTTL(int64(durableDedupTTL.Seconds())))
+	}
 	if splitBatchPartitionByFunction {
 		batchOpts = append(batchOpts, batch.WithSplitBatchPartitionByFunction(func(_ context.Context, _ uuid.UUID) bool {
 			return true
@@ -530,9 +549,10 @@ func start(ctx context.Context, opts StartOpts) error {
 					hd,
 				),
 				Lifecycle{
-					Cqrs:       dbcqrs,
-					Pb:         pb,
-					EventTopic: opts.Config.EventStream.Service.Concrete.TopicName(),
+					Cqrs:         dbcqrs,
+					Pb:           pb,
+					EventTopic:   opts.Config.EventStream.Service.Concrete.TopicName(),
+					RunsRecorded: opts.EventStream.durable(),
 				},
 				run.NewTraceLifecycleListener(nil),
 			}, metrics.NewLifecycleListeners()...)...,
@@ -575,6 +595,10 @@ func start(ctx context.Context, opts StartOpts) error {
 		executor.WithEnableBatchingInstrumentation(func(ctx context.Context, accountID, envID uuid.UUID) (enable bool) {
 			return false
 		}),
+	}
+
+	if opts.EventStream.durable() {
+		executorOpts = append(executorOpts, executor.WithRunRecorder(newRunRecorder(dbcqrs)))
 	}
 
 	exec, err := executor.NewExecutor(executorOpts...)
@@ -807,10 +831,11 @@ func start(ctx context.Context, opts StartOpts) error {
 	}
 
 	ds.Apiservice = api.NewService(api.APIServiceOptions{
-		Config:         ds.Opts.Config,
-		Mounts:         mounts,
-		LocalEventKeys: opts.EventKeys,
-		Logger:         l,
+		Config:          ds.Opts.Config,
+		Mounts:          mounts,
+		LocalEventKeys:  opts.EventKeys,
+		MaxRequestBytes: opts.EventStream.MaxRequestBytes,
+		Logger:          l,
 	})
 
 	services = append(services, ds, runner, executorSvc, ds.Apiservice, connGateway)

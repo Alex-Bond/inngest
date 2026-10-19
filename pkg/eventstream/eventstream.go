@@ -136,6 +136,14 @@ func ParseStream(
 				return nil
 			}
 		}
+		// More is false on a read error too, so only a closing ']' proves a complete array.
+		end, err := d.Token()
+		if err != nil {
+			return err
+		}
+		if end != json.Delim(']') {
+			return ErrInvalidRequestBody
+		}
 	default:
 		return ErrInvalidRequestBody
 	}

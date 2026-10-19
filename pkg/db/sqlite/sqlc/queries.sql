@@ -177,8 +177,9 @@ UPDATE functions SET archived_at = datetime('now') WHERE id IN (sqlc.slice('ids'
 
 -- name: InsertFunctionRun :exec
 INSERT INTO function_runs
-	(run_id, run_started_at, function_id, function_version, trigger_type, event_id, batch_id, original_run_id, cron, workspace_id) VALUES
-	(?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	(run_id, run_started_at, function_id, function_version, trigger_type, event_id, batch_id, original_run_id, cron, workspace_id)
+SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+WHERE NOT EXISTS (SELECT 1 FROM function_runs WHERE run_id = ?1);
 
 -- name: InsertFunctionFinish :exec
 INSERT INTO function_finishes
@@ -216,8 +217,9 @@ SELECT * FROM function_finishes WHERE run_id IN (sqlc.slice('run_ids'));
 
 -- name: InsertEvent :exec
 INSERT INTO events
-	(internal_id, received_at, event_id, event_name, event_data, event_user, event_v, event_ts) VALUES
-	(?, ?, ?, ?, ?, ?, ?, ?);
+	(internal_id, received_at, event_id, event_name, event_data, event_user, event_v, event_ts)
+SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+WHERE NOT EXISTS (SELECT 1 FROM events WHERE internal_id = ?1);
 
 -- name: InsertEventBatch :exec
 INSERT INTO event_batches

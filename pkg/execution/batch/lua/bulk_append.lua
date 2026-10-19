@@ -53,30 +53,57 @@ if is_status_empty(batchMetadataKey) then
   set_batch_status(batchMetadataKey, batchStatusAppending)
 end
 
--- Dedup: per-event SET keys (O(1))
+-- Dedup: per-event keys (O(1)) storing each event's batch, which a duplicate reports for scheduling.
 local eventsToAdd = {}
+local idsToAdd = {}
+local seenInCall = {}
+local duplicateBatchIDs = {}
+local seenDuplicateBatch = {}
 local duplicateCount = 0
 local committedBytes = 0
 local argOffset = 11
+
+local function add_duplicate_batch(id)
+  if not seenDuplicateBatch[id] then
+    seenDuplicateBatch[id] = true
+    table.insert(duplicateBatchIDs, id)
+  end
+end
 
 for i = 1, eventCount do
   local eventID = ARGV[argOffset + (i - 1) * 2]
   local eventData = ARGV[argOffset + (i - 1) * 2 + 1]
 
   local idemKey = string.format(idemKeyFmt, prefix, eventID)
-  local newEvent = redis.call("SET", idemKey, "1", "NX", "EX", idempotenceSetTTL)
-  if not newEvent then newEvent = false end
-  if newEvent then
-    table.insert(eventsToAdd, eventData)
-    committedBytes = committedBytes + string.len(eventData)
-  else
+  local existing = redis.call("GET", idemKey)
+  if existing then
     duplicateCount = duplicateCount + 1
+    -- "1" predates storing the batch ID; fall back to the current batch.
+    if existing == "1" then
+      add_duplicate_batch(batchID)
+    else
+      add_duplicate_batch(existing)
+    end
+  elseif seenInCall[eventID] then
+    duplicateCount = duplicateCount + 1
+  else
+    seenInCall[eventID] = true
+    table.insert(eventsToAdd, eventData)
+    table.insert(idsToAdd, eventID)
+    committedBytes = committedBytes + string.len(eventData)
   end
+end
+
+local function encode_result(result)
+  if #duplicateBatchIDs > 0 then
+    result.duplicateBatchIDs = duplicateBatchIDs
+  end
+  return cjson.encode(result)
 end
 
 -- If all events were duplicates, return early
 if #eventsToAdd == 0 then
-  return cjson.encode({
+  return encode_result({
     status = "itemexists",
     batchID = batchID,
     batchPointerKey = batchPointerKey,
@@ -111,6 +138,14 @@ end
 local finalLen = currentLen
 if #eventsForCurrentBatch > 0 then
   finalLen = redis.call("RPUSH", batchKey, unpack(eventsForCurrentBatch))
+end
+
+for i = 1, #idsToAdd do
+  local target = batchID
+  if i > #eventsForCurrentBatch then
+    target = overflowULID
+  end
+  redis.call("SET", string.format(idemKeyFmt, prefix, idsToAdd[i]), target, "EX", idempotenceSetTTL)
 end
 
 -- Check batch size limit
@@ -164,7 +199,7 @@ if batchFull then
   end
 end
 
-return cjson.encode({
+return encode_result({
   status = status,
   batchID = batchID,
   batchPointerKey = batchPointerKey,

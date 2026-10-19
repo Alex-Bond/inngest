@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -18,6 +20,7 @@ import (
 	"github.com/inngest/inngest/pkg/headers"
 	"github.com/inngest/inngest/pkg/logger"
 	"github.com/inngest/inngest/pkg/publicerr"
+	"github.com/inngest/inngest/pkg/pubsub"
 	"github.com/inngest/inngest/pkg/telemetry/metrics"
 	itrace "github.com/inngest/inngest/pkg/telemetry/trace"
 	"go.opentelemetry.io/otel/propagation"
@@ -29,15 +32,38 @@ import (
 const (
 	DefaultAPIPort = 8288
 	HealthPath     = "/health"
+	// ReadinessPath fails while shutting down or while the event stream backend is unreachable;
+	// HealthPath stays always-200 so a liveness probe never depends on the backend.
+	ReadinessPath = "/health/ready"
+
+	// shutdownTimeout lets in-flight requests finish publishing on shutdown.
+	shutdownTimeout = 20 * time.Second
 )
 
 type EventHandler func(context.Context, *event.Event, *event.SeededID) (string, error)
+
+// EventIngester publishes all of a request's events in one batch after every
+// event parsed, so a 200 is only written once all of them are published.
+type EventIngester interface {
+	PrepareEvent(ctx context.Context, e *event.Event, seed *event.SeededID) (string, pubsub.Message, error)
+	PublishEvents(ctx context.Context, msgs []pubsub.Message) error
+	// Admit rejects a request up front while the stream is unavailable or full.
+	Admit() error
+	// Ready reports whether the stream backend is reachable.
+	Ready() bool
+}
 
 type Options struct {
 	Config config.Config
 
 	EventHandler EventHandler
 	Logger       logger.Logger
+
+	// Ingester, when set, replaces EventHandler for the event endpoint.
+	Ingester EventIngester
+
+	// MaxRequestBytes caps the body of a single event request; 0 disables.
+	MaxRequestBytes int64
 
 	// LocalEventKeys are the keys used to send events to the local event API
 	// from an app. If this is set, only keys that match one of these values
@@ -55,12 +81,15 @@ func NewAPI(o Options) (chi.Router, error) {
 	logger := o.Logger.With("caller", "api")
 
 	api := &API{
-		Router:         chi.NewMux(),
-		config:         o.Config,
-		handler:        o.EventHandler,
-		log:            logger,
-		localEventKeys: o.LocalEventKeys,
-		requireKeys:    o.RequireKeys,
+		Router:          chi.NewMux(),
+		config:          o.Config,
+		handler:         o.EventHandler,
+		ingester:        o.Ingester,
+		maxRequestBytes: o.MaxRequestBytes,
+		log:             logger,
+		localEventKeys:  o.LocalEventKeys,
+		requireKeys:     o.RequireKeys,
+		shuttingDown:    &atomic.Bool{},
 	}
 
 	cors := cors.New(cors.Options{
@@ -75,6 +104,7 @@ func NewAPI(o Options) (chi.Router, error) {
 	api.Use(headers.StaticHeadersMiddleware(o.Config.GetServerKind()))
 
 	api.Get(HealthPath, api.HealthCheck)
+	api.Get(ReadinessPath, api.ReadinessCheck)
 	api.Post("/e/{key}", api.ReceiveEvent)
 	api.Post("/invoke/{slug}", api.Invoke)
 
@@ -86,10 +116,16 @@ type API struct {
 
 	config config.Config
 
-	handler EventHandler
-	log     logger.Logger
+	handler  EventHandler
+	ingester EventIngester
+	log      logger.Logger
+
+	maxRequestBytes int64
 
 	server *http.Server
+
+	// shuttingDown fails readiness once shutdown starts.
+	shuttingDown *atomic.Bool
 
 	// localEventKeys are the keys used to send events to the local event API
 	// from an app. If this is set, only keys that match one of these values
@@ -121,7 +157,10 @@ func (a *API) Start(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		a.log.Info("shutting down server")
-		return a.server.Shutdown(ctx)
+		a.shuttingDown.Store(true)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		return a.server.Shutdown(shutdownCtx)
 	case err := <-lerrChan:
 		return err
 	}
@@ -142,6 +181,20 @@ func (a API) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		StatusCode: http.StatusOK,
 		Message:    "OK",
 	})
+}
+
+// ReadinessCheck fails while shutting down or while the event stream backend is unreachable.
+func (a API) ReadinessCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Content-Type", "application/json")
+	if a.shuttingDown != nil && a.shuttingDown.Load() {
+		a.writeResponse(w, apiResponse{StatusCode: http.StatusServiceUnavailable, Error: "Shutting down"})
+		return
+	}
+	if a.ingester != nil && !a.ingester.Ready() {
+		a.writeResponse(w, apiResponse{StatusCode: http.StatusServiceUnavailable, Error: "Event stream unavailable"})
+		return
+	}
+	a.writeResponse(w, apiResponse{StatusCode: http.StatusOK, Message: "OK"})
 }
 
 func (a API) ReceiveEvent(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +244,18 @@ func (a API) ReceiveEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if a.maxRequestBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, a.maxRequestBytes)
+	}
+
+	if a.ingester != nil {
+		if err := a.ingester.Admit(); err != nil {
+			a.log.Warn("rejecting events; event stream cannot accept them", "error", err)
+			writeEventsUnavailable(w, nil, err)
+			return
+		}
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 
 	// Create a new trace that may have a link to a previous one
@@ -227,6 +292,9 @@ func (a API) ReceiveEvent(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+
+	// msgs collects the prepared events an ingester publishes after parsing.
+	var msgs []pubsub.Message
 
 	// Process those incoming events
 	eg.Go(func() error {
@@ -268,7 +336,14 @@ func (a API) ReceiveEvent(w http.ResponseWriter, r *http.Request) {
 				r.Header.Get(headers.HeaderEventIDSeed),
 				index,
 			)
-			id, err := a.handler(ctx, &evt, seed)
+			var id string
+			if a.ingester != nil {
+				var m pubsub.Message
+				id, m, err = a.ingester.PrepareEvent(ctx, &evt, seed)
+				msgs = append(msgs, m)
+			} else {
+				id, err = a.handler(ctx, &evt, seed)
+			}
 			if err != nil {
 				a.log.Error("error handling event", "error", err, "event", evt.Name)
 				return err
@@ -290,20 +365,53 @@ func (a API) ReceiveEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		w.WriteHeader(400)
+		status := 400
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		respIDs := ids[0 : max+1]
+		if a.ingester != nil {
+			// Nothing was published, so no ID is valid.
+			respIDs = []string{}
+		}
+		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(apiutil.EventAPIResponse{
-			IDs:    ids[0 : max+1],
-			Status: 400,
+			IDs:    respIDs,
+			Status: status,
 			Error:  err.Error(),
 		})
 
 		return
 	}
 
+	if a.ingester != nil && len(msgs) > 0 {
+		if err := a.ingester.PublishEvents(r.Context(), msgs); err != nil {
+			a.log.Error("error publishing events", "error", err, "count", len(msgs))
+			writeEventsUnavailable(w, ids[0:max+1], err)
+			return
+		}
+	}
+
 	w.WriteHeader(200)
 	_ = json.NewEncoder(w).Encode(apiutil.EventAPIResponse{
 		IDs:    ids[0 : max+1],
 		Status: 200,
+	})
+}
+
+// writeEventsUnavailable answers 503 so SDKs retry the send; their retry reuses
+// the ID seed, so events already published are deduplicated downstream.
+func writeEventsUnavailable(w http.ResponseWriter, ids []string, err error) {
+	if ids == nil {
+		ids = []string{}
+	}
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(apiutil.EventAPIResponse{
+		IDs:    ids,
+		Status: http.StatusServiceUnavailable,
+		Error:  err.Error(),
 	})
 }
 

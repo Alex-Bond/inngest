@@ -563,6 +563,7 @@ type executor struct {
 	lifecycles     []execution.LifecycleListener
 	evtLifecycles  []execution.EventLifecycleListener
 	syncLifecycles []execution.SyncLifecycleListener
+	runRecorder    RunRecorder
 
 	// rtpub represents teh realtime publisher used to broadcast notifications
 	// on run execution.
@@ -1080,7 +1081,7 @@ func (e *executor) Schedule(ctx context.Context, req execution.ScheduleRequest) 
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
 			l.OnFunctionSkippedIdempotency(ctx, callbackReq, skip)
 		})
-	case errors.Is(err, ErrFunctionDebounced), errors.Is(err, ErrFunctionSkipped), err == nil:
+	case errors.Is(err, ErrFunctionDebounced), errors.Is(err, ErrFunctionSkipped), errors.Is(err, ErrRunNotRecorded), err == nil:
 		// Handled by more specific lifecycle hooks inside schedule.
 	default:
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
@@ -1796,7 +1797,7 @@ func (e *executor) schedule(
 		e.runEventLifecycles(ctx, func(ctx context.Context, l execution.EventLifecycleListener) {
 			l.OnFunctionScheduled(ctx, metadataSnapshot, reqSnapshot.Events)
 		})
-		return &metadata.ID.RunID, &metadata, nil
+		return &metadata.ID.RunID, &metadata, e.recordRun(ctx, metadata)
 	}
 
 	// Schedule for async functons (the default)
@@ -1900,6 +1901,9 @@ func (e *executor) schedule(
 				"new_state_deleted", !keepState,
 			)
 		}
+		if err := e.recordExistingRun(ctx, err, metadata, stateCreated); err != nil {
+			return nil, nil, err
+		}
 		return &metadata.ID.RunID, nil, state.ErrIdentifierExists
 
 	case errors.Is(err, queue.ErrQueueItemSingletonExists):
@@ -1935,7 +1939,7 @@ func (e *executor) schedule(
 		l.OnFunctionScheduled(ctx, metadataSnapshot, reqSnapshot.Events)
 	})
 
-	return &metadata.ID.RunID, &metadata, nil
+	return &metadata.ID.RunID, &metadata, e.recordRun(ctx, metadata)
 }
 
 func (e *executor) updateInvokeSpanWithInvokedRunID(ctx context.Context, l logger.Logger, events []event.TrackedEvent, invokedRunID ulid.ULID) {
@@ -5919,9 +5923,10 @@ func (e *executor) AppendAndScheduleBatch(ctx context.Context, fn inngest.Functi
 	}
 
 	switch result.Status {
-	case enums.BatchAppend, enums.BatchItemExists:
+	case enums.BatchAppend:
 		// noop
-	case enums.BatchNew:
+	case enums.BatchNew, enums.BatchItemExists:
+		// A duplicate reports the batch it first joined, which may be unscheduled; scheduling is idempotent.
 		dur, err := time.ParseDuration(fn.EventBatch.Timeout)
 		if err != nil {
 			return err
@@ -5943,13 +5948,15 @@ func (e *executor) AppendAndScheduleBatch(ctx context.Context, fn inngest.Functi
 			return err
 		}
 
-		metrics.IncrBatchScheduledCounter(ctx, metrics.CounterOpt{
-			PkgName: pkgName,
-			Tags: map[string]any{
-				"account_id":  bi.AccountID.String(),
-				"function_id": bi.FunctionID.String(),
-			},
-		})
+		if result.Status == enums.BatchNew {
+			metrics.IncrBatchScheduledCounter(ctx, metrics.CounterOpt{
+				PkgName: pkgName,
+				Tags: map[string]any{
+					"account_id":  bi.AccountID.String(),
+					"function_id": bi.FunctionID.String(),
+				},
+			})
+		}
 	case enums.BatchFull, enums.BatchMaxSize:
 		// start execution immediately
 		if err := e.RetrieveAndScheduleBatch(ctx, fn, batch.ScheduleBatchPayload{
@@ -5987,9 +5994,21 @@ func parseBatchID(raw string) (ulid.ULID, error) {
 // RetrieveAndScheduleBatch retrieves all items from a started batch and schedules a function run
 func (e *executor) RetrieveAndScheduleBatch(ctx context.Context, fn inngest.Function, payload batch.ScheduleBatchPayload, opts *execution.BatchExecOpts) error {
 	enableInstrumentation := e.enableBatchingInstrumentation != nil && e.enableBatchingInstrumentation(ctx, payload.AccountID, payload.WorkspaceID)
-	evtList, err := e.batcher.RetrieveItems(ctx, payload.FunctionID, payload.BatchID)
-
 	l := logger.StdlibLogger(ctx).With("accountID", payload.AccountID, "workspace_id", payload.WorkspaceID, "batchID", payload.BatchID)
+	key := fmt.Sprintf("%s-%s", fn.ID, payload.BatchID)
+
+	if opts != nil && opts.Replay {
+		replayable, err := e.batchReplayable(ctx, fn, payload, key)
+		if err != nil {
+			return err
+		}
+		if !replayable {
+			l.Warn("started batch outlived its run idempotency, dropping it", "function_id", payload.FunctionID)
+			return e.batcher.DeleteKeys(ctx, payload.FunctionID, payload.BatchID)
+		}
+	}
+
+	evtList, err := e.batcher.RetrieveItems(ctx, payload.FunctionID, payload.BatchID)
 	if enableInstrumentation {
 		l.Debug("retrieved batch items", "events", len(evtList), "err", err)
 	}
@@ -6037,7 +6056,6 @@ func (e *executor) RetrieveAndScheduleBatch(ctx context.Context, fn inngest.Func
 		}
 	}
 
-	key := fmt.Sprintf("%s-%s", fn.ID, payload.BatchID)
 	_, md, err := e.Schedule(ctx, execution.ScheduleRequest{
 		AccountID:        payload.AccountID,
 		WorkspaceID:      payload.WorkspaceID,
@@ -6079,6 +6097,7 @@ func (e *executor) RetrieveAndScheduleBatch(ctx context.Context, fn inngest.Func
 	// Don't bother if it's already there
 	// If function is paused, we do not schedule runs
 	if errors.Is(err, queue.ErrQueueItemExists) ||
+		errors.Is(err, state.ErrIdentifierExists) ||
 		errors.Is(err, ErrFunctionSkipped) ||
 		errors.Is(err, ErrFunctionSkippedIdempotency) {
 		span.SetAttributes(attribute.Bool(consts.OtelSysStepDelete, true))
@@ -6105,6 +6124,25 @@ func (e *executor) RetrieveAndScheduleBatch(ctx context.Context, fn inngest.Func
 	}
 
 	return nil
+}
+
+// batchReplayable reports whether rescheduling a started batch cannot mint a second run: its run's
+// idempotency record still dedupes it, or the batch is too young for that record to have expired.
+func (e *executor) batchReplayable(ctx context.Context, fn inngest.Function, payload batch.ScheduleBatchPayload, key string) (bool, error) {
+	id := sv2.ID{
+		RunID:      payload.BatchID,
+		FunctionID: fn.ID,
+		Tenant:     sv2.Tenant{AccountID: payload.AccountID, EnvID: payload.WorkspaceID, AppID: payload.AppID},
+	}
+	entry, err := e.smv2.LookupIdempotency(ctx, id, idempotencyKey(execution.ScheduleRequest{Function: fn, IdempotencyKey: &key}, payload.BatchID))
+	if err != nil {
+		return false, fmt.Errorf("error looking up batch run idempotency: %w", err)
+	}
+	if entry != nil {
+		return true, nil
+	}
+	// The record is written when the run is created, which is never before the batch ID's time.
+	return e.now().Sub(ulid.Time(payload.BatchID.Time())) < consts.FunctionIdempotencyPeriod, nil
 }
 
 func (e *executor) GetEvent(ctx context.Context, id ulid.ULID, accountID uuid.UUID, workspaceID uuid.UUID) (any, error) {

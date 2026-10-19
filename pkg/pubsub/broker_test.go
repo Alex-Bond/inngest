@@ -192,3 +192,45 @@ func TestCancellation(t *testing.T) {
 	<-time.After(time.Second)
 	require.EqualValues(t, 1, i)
 }
+
+// On shutdown SubscribeN waits for in-flight handlers, and those handlers keep
+// a live context so their writes are not aborted half-way.
+func TestSubscribeNDrainsHandlersOnShutdown(t *testing.T) {
+	b, topic := testbroker(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var handlerCtxErr error
+	var finished int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := b.SubscribeN(ctx, topic, func(c context.Context, m Message) error {
+			if m.Name != "drain" {
+				return nil
+			}
+			close(started)
+			<-release
+			handlerCtxErr = c.Err()
+			atomic.AddInt32(&finished, 1)
+			return nil
+		}, 10)
+		require.NoError(t, err)
+	}()
+
+	<-time.After(time.Second)
+	require.NoError(t, b.Publish(context.Background(), topic, Message{Name: "drain"}))
+	<-started
+	cancel()
+
+	select {
+	case <-done:
+		t.Fatal("SubscribeN returned while a handler was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-done
+	require.EqualValues(t, 1, atomic.LoadInt32(&finished))
+	require.NoError(t, handlerCtxErr)
+}

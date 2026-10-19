@@ -342,11 +342,10 @@ func TestBatchAppendIdempotenceDifferentBatches(t *testing.T) {
 		lastBatchID = res.BatchID
 	}
 
-	// Append the last batchitem again. This should be rejected from the next batch.
+	// A duplicate after rotation reports the full batch it is in, so that batch can be scheduled.
 	res, err := bm.Append(context.Background(), bi, function)
 	require.NoError(t, err)
-	require.NotEmpty(t, res.BatchID)
-	require.NotEqual(t, res.BatchID, lastBatchID)
+	require.Equal(t, lastBatchID, res.BatchID)
 	require.NotEmpty(t, res.BatchPointerKey)
 	require.Equal(t, enums.BatchItemExists, res.Status)
 }

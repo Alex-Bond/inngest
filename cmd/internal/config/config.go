@@ -54,6 +54,14 @@ type Config struct {
 	PostgresConnMaxLifetime int    `koanf:"postgres-conn-max-lifetime"`
 	SqliteDir               string `koanf:"sqlite-dir"`
 
+	// Event stream configuration
+	EventStream                 string `koanf:"event-stream"`
+	EventStreamConcurrency      int    `koanf:"event-stream-concurrency"`
+	EventStreamMaxBacklog       int    `koanf:"event-stream-max-backlog"`
+	EventStreamMaxMemoryPercent int    `koanf:"event-stream-max-memory-percent"`
+	EventStreamDrainTimeout     int    `koanf:"event-stream-drain-timeout"`
+	EventStreamMaxRequestBytes  int    `koanf:"event-stream-max-request-bytes"`
+
 	// Tracing
 	SystemTraceEndpoint string `koanf:"system-trace-endpoint"`
 	SystemTraceURLPath  string `koanf:"system-trace-url-path"`

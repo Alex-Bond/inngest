@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"math/rand"
 	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -539,5 +542,46 @@ func TestParseStream_FormUrlencoded(t *testing.T) {
 		}
 		r.NoError(eg.Wait())
 		r.Equal(1, n)
+	})
+}
+
+// A read error between array elements must fail the parse; otherwise the
+// events before it look like a complete request.
+func TestParseStream_ArrayReadErrorBetweenElements(t *testing.T) {
+	// Whitespace before the comma: More peeks into it and hits the error.
+	first := `[{"name":"a","data":{}}`
+	body := first + strings.Repeat(" ", 64) + `,{"name":"b","data":{}}]`
+
+	parse := func(r io.Reader) ([]StreamItem, error) {
+		stream := make(chan StreamItem)
+		var items []StreamItem
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for item := range stream {
+				items = append(items, item)
+			}
+		}()
+		err := ParseStream(context.Background(), r, stream, 1024, "application/json")
+		<-done
+		return items, err
+	}
+
+	t.Run("limit lands in whitespace", func(t *testing.T) {
+		r := http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(strings.NewReader(body)), int64(len(first)+10))
+		_, err := parse(r)
+		var tooLarge *http.MaxBytesError
+		require.ErrorAs(t, err, &tooLarge)
+	})
+
+	t.Run("truncated body", func(t *testing.T) {
+		_, err := parse(strings.NewReader(first + "  "))
+		require.Error(t, err)
+	})
+
+	t.Run("complete body", func(t *testing.T) {
+		items, err := parse(strings.NewReader(body))
+		require.NoError(t, err)
+		require.Len(t, items, 2)
 	})
 }

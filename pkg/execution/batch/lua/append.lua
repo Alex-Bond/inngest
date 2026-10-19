@@ -51,22 +51,27 @@ if is_status_empty(batchMetadataKey) then
   set_batch_status(batchMetadataKey, batchStatusAppending)
 end
 
--- Dedup: per-event SET key (O(1))
+-- Dedup: per-event key (O(1)) storing the event's batch, which a duplicate reports for scheduling.
 local idemKey = string.format(idemKeyFmt, prefix, eventID)
-local newEvent = redis.call("SET", idemKey, "1", "NX", "EX", idempotenceSetTTL)
-if not newEvent then newEvent = false end
-if not newEvent then
-  local size = redis.call("LLEN", batchKey)
-  if size == 1 then
-    resp = { status = "new", batchID = batchID, batchPointerKey = batchPointerKey, committed = 0, duplicates = 1, committedBytes = 0 }
-  else
-    resp = { status = "itemexists", batchID = batchID, batchPointerKey = batchPointerKey, committed = 0, duplicates = 1, committedBytes = 0 }
+local existing = redis.call("GET", idemKey)
+if existing then
+  -- "1" predates storing the batch ID; fall back to the current batch.
+  local duplicateBatchID = batchID
+  if existing ~= "1" then
+    duplicateBatchID = existing
   end
+  local status = "itemexists"
+  if duplicateBatchID == batchID and redis.call("LLEN", batchKey) == 1 then
+    -- the retried event opened this batch, which may not be scheduled yet
+    status = "new"
+  end
+  resp = { status = status, batchID = duplicateBatchID, batchPointerKey = batchPointerKey, committed = 0, duplicates = 1, committedBytes = 0 }
   return cjson.encode(resp)
 end
 
 -- append event to batch
 local len = redis.call("RPUSH", batchKey, event)
+redis.call("SET", idemKey, batchID, "EX", idempotenceSetTTL)
 resp.committed = 1
 resp.committedBytes = string.len(event)
 

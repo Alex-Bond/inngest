@@ -46,16 +46,20 @@ type APIServiceOptions struct {
 	// ingesting events will not work.
 	RequireKeys bool
 
+	// MaxRequestBytes caps an event request body on a durable stream; 0 disables.
+	MaxRequestBytes int64
+
 	Logger logger.Logger
 }
 
 func NewService(opts APIServiceOptions) service.Service {
 	return &apiServer{
-		config:         opts.Config,
-		mounts:         opts.Mounts,
-		localEventKeys: opts.LocalEventKeys,
-		requireKeys:    opts.RequireKeys,
-		log:            opts.Logger,
+		config:          opts.Config,
+		mounts:          opts.Mounts,
+		localEventKeys:  opts.LocalEventKeys,
+		requireKeys:     opts.RequireKeys,
+		maxRequestBytes: opts.MaxRequestBytes,
+		log:             opts.Logger,
 	}
 }
 
@@ -63,6 +67,11 @@ type apiServer struct {
 	config    config.Config
 	api       *API
 	publisher pubsub.Publisher
+	// batch and gate are set when the event stream is durable.
+	batch pubsub.BatchPublisher
+	gate  pubsub.IngestGate
+
+	maxRequestBytes int64
 
 	mounts []Mount
 
@@ -86,13 +95,25 @@ func (a *apiServer) Name() string {
 func (a *apiServer) Pre(ctx context.Context) error {
 	var err error
 
-	api, err := NewAPI(Options{
+	a.publisher, err = pubsub.NewPublisher(ctx, a.config.EventStream.Service)
+	if err != nil {
+		return err
+	}
+	a.batch, _ = a.publisher.(pubsub.BatchPublisher)
+	a.gate, _ = a.publisher.(pubsub.IngestGate)
+
+	opts := Options{
 		Config:         a.config,
 		Logger:         a.log,
 		EventHandler:   a.handleEvent,
 		LocalEventKeys: a.localEventKeys,
 		RequireKeys:    a.requireKeys,
-	})
+	}
+	if a.batch != nil && a.gate != nil {
+		opts.Ingester = a
+		opts.MaxRequestBytes = a.maxRequestBytes
+	}
+	api, err := NewAPI(opts)
 	if err != nil {
 		return err
 	}
@@ -106,15 +127,13 @@ func (a *apiServer) Pre(ctx context.Context) error {
 		api.Mount(m.At, m.Router)
 	}
 
-	a.publisher, err = pubsub.NewPublisher(ctx, a.config.EventStream.Service)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
 func (a *apiServer) Run(ctx context.Context) error {
+	if a.gate != nil {
+		go a.gate.Watch(ctx)
+	}
 	err := a.api.Start(ctx)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -127,6 +146,36 @@ func (a *apiServer) handleEvent(
 	e *event.Event,
 	seed *event.SeededID,
 ) (string, error) {
+	id, msg, err := a.PrepareEvent(ctx, e, seed)
+	if err != nil {
+		return "", err
+	}
+
+	err = a.publisher.Publish(ctx, a.config.EventStream.Service.TopicName(), msg)
+	if err != nil {
+		trace.SpanFromContext(ctx).SetStatus(codes.Error, err.Error())
+	}
+	return id, err
+}
+
+func (a *apiServer) PublishEvents(ctx context.Context, msgs []pubsub.Message) error {
+	return a.batch.PublishBatch(ctx, a.config.EventStream.Service.TopicName(), msgs)
+}
+
+func (a *apiServer) Admit() error {
+	return a.gate.Admit()
+}
+
+func (a *apiServer) Ready() bool {
+	return a.gate.Ready()
+}
+
+// PrepareEvent assigns the event's internal ID and builds its stream message.
+func (a *apiServer) PrepareEvent(
+	ctx context.Context,
+	e *event.Event,
+	seed *event.SeededID,
+) (string, pubsub.Message, error) {
 	// ctx is the request context, so we need to re-add
 	// the caller here.
 	l := a.log.With("caller", "api")
@@ -144,7 +193,7 @@ func (a *apiServer) handleEvent(
 	if err != nil {
 		l.Error("error unmarshalling event as JSON", "error", err)
 		span.SetStatus(codes.Error, "error parsing event as JSON")
-		return "", err
+		return "", pubsub.Message{}, err
 	}
 
 	l.Info("publishing event",
@@ -157,23 +206,14 @@ func (a *apiServer) handleEvent(
 	carrier := itrace.NewTraceCarrier()
 	itrace.UserTracer().Propagator().Inject(ctx, propagation.MapCarrier(carrier.Context))
 
-	err = a.publisher.Publish(
-		ctx,
-		a.config.EventStream.Service.TopicName(),
-		pubsub.Message{
-			Name:      event.EventReceivedName,
-			Data:      string(byt),
-			Timestamp: time.Now(),
-			Metadata: map[string]any{
-				consts.OtelPropagationKey: carrier,
-			},
+	return trackedEvent.GetInternalID().String(), pubsub.Message{
+		Name:      event.EventReceivedName,
+		Data:      string(byt),
+		Timestamp: time.Now(),
+		Metadata: map[string]any{
+			consts.OtelPropagationKey: carrier,
 		},
-	)
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-	}
-
-	return trackedEvent.GetInternalID().String(), err
+	}, nil
 }
 
 func (a *apiServer) Stop(ctx context.Context) error {

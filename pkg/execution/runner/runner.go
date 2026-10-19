@@ -33,6 +33,7 @@ import (
 	"github.com/inngest/inngest/pkg/service"
 	"github.com/inngest/inngest/pkg/telemetry/metrics"
 	itrace "github.com/inngest/inngest/pkg/telemetry/trace"
+	"github.com/inngest/inngest/pkg/util"
 	"github.com/oklog/ulid/v2"
 	"go.opentelemetry.io/otel/propagation"
 )
@@ -117,7 +118,7 @@ func WithSyncLifecycleListeners(l ...execution.SyncLifecycleListener) func(s *sv
 }
 
 func NewService(c config.Config, opts ...Opt) Runner {
-	svc := &svc{config: c, log: logger.StdlibLogger(context.Background())}
+	svc := &svc{config: c, log: logger.StdlibLogger(context.Background()), eventLock: util.NewKeyedMutex()}
 	for _, o := range opts {
 		o(svc)
 	}
@@ -157,6 +158,9 @@ type svc struct {
 	// syncLifecycles are invoked synchronously (inline) whenever an event is
 	// durably created, regardless of whether it later matches a function.
 	syncLifecycles []execution.SyncLifecycleListener
+
+	// eventLock serialises inserts per event so concurrent redeliveries can't both pass NOT EXISTS.
+	eventLock *util.KeyedMutex
 
 	log logger.Logger
 }
@@ -198,7 +202,14 @@ func (s *svc) Run(ctx context.Context) error {
 	// This is necessary for batch buffering - when Append() blocks waiting for
 	// the buffer to fill/flush, we need other events to be processed concurrently
 	// to fill the buffer.
-	err := s.pubsub.SubscribeN(ctx, s.config.EventStream.Service.TopicName(), s.handleMessage, 1000)
+	concurrency := int64(1000)
+	if rs, ok := s.config.EventStream.Service.Concrete.(*config.RedisMessaging); ok {
+		concurrency = rs.Concurrency
+		if concurrency <= 0 {
+			concurrency = pubsub.DefaultStreamConcurrency
+		}
+	}
+	err := s.pubsub.SubscribeN(ctx, s.config.EventStream.Service.TopicName(), s.handleMessage, concurrency)
 	if err != nil {
 		return err
 	}
@@ -319,10 +330,13 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 	}
 
 	// Write the event to our CQRS manager for long-term storage.
+	internalID := tracked.GetInternalID()
+	unlock := s.eventLock.Lock(internalID[:])
 	err = s.cqrs.InsertEvent(
 		ctx,
-		cqrs.ConvertFromEvent(tracked.GetInternalID(), tracked.GetEvent()),
+		cqrs.ConvertFromEvent(internalID, tracked.GetEvent()),
 	)
+	unlock()
 	if err != nil {
 		return err
 	}
@@ -338,7 +352,15 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 
 	l.Info("received event")
 
-	var errs error
+	var (
+		errs  error
+		errMu sync.Mutex
+	)
+	appendErr := func(err error) {
+		errMu.Lock()
+		errs = multierror.Append(errs, err)
+		errMu.Unlock()
+	}
 	wg := &sync.WaitGroup{}
 
 	// Trigger both new functions and pauses.
@@ -347,7 +369,7 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 		defer wg.Done()
 		if err := s.functions(ctx, tracked); err != nil {
 			l.Error("error scheduling functions", "error", err)
-			errs = multierror.Append(errs, err)
+			appendErr(err)
 		}
 	}()
 
@@ -365,7 +387,7 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 				}
 
 				l.Error("error resuming function after invoke", "error", err)
-				errs = multierror.Append(errs, err)
+				appendErr(err)
 			}
 		}()
 	}
@@ -375,7 +397,7 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 		defer wg.Done()
 		if err := s.pauses(ctx, tracked); err != nil {
 			l.Error("error consuming pauses", "error", err)
-			errs = multierror.Append(errs, err)
+			appendErr(err)
 		}
 	}()
 
@@ -429,7 +451,16 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 
 	// Don't use an errgroup here as we want all errors together, vs the first
 	// non-nil error.
-	var errs error
+	// Every return waits for wg, as the event is acked on return.
+	var (
+		errs  error
+		errMu sync.Mutex
+	)
+	appendErr := func(err error) {
+		errMu.Lock()
+		errs = multierror.Append(errs, err)
+		errMu.Unlock()
+	}
 	wg := &sync.WaitGroup{}
 
 	wg.Add(1)
@@ -439,8 +470,6 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 		// Find any invoke functions specified.
 		fn, err := FindInvokedFunction(ctx, tracked, s.data)
 		if err != nil {
-			errs = multierror.Append(errs, err)
-
 			// If this errored, then we were supposed to find a function to
 			// invoke. In this case, emit a completion event with the error.
 			perr := s.executor.InvokeFailHandler(ctx, execution.InvokeFailHandlerOpts{
@@ -454,7 +483,11 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 				},
 			})
 			if perr != nil {
-				errs = multierror.Append(errs, perr)
+				appendErr(err)
+				appendErr(perr)
+			} else {
+				// The invoker was failed; a redelivery would only fail it again.
+				s.log.Warn("invoked function not found; failed the invoker", "error", err)
 			}
 		}
 		if fn != nil {
@@ -466,7 +499,7 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 					"error", err,
 					"function", fn.Name,
 				)
-				errs = multierror.Append(errs, err)
+				appendErr(err)
 			}
 		}
 	}()
@@ -474,10 +507,13 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 	// Look up all functions have a trigger that matches the event name, including wildcards.
 	fns, err := s.data.FunctionsByTrigger(ctx, evt.Name)
 	if err != nil {
-		return fmt.Errorf("error loading functions by trigger: %w", err)
+		appendErr(fmt.Errorf("error loading functions by trigger: %w", err))
+		wg.Wait()
+		return errs
 	}
 	if len(fns) == 0 {
-		return nil
+		wg.Wait()
+		return errs
 	}
 
 	s.log.Debug("scheduling functions", "len", len(fns))
@@ -524,7 +560,7 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 						"event": evtMap,
 					})
 					if evalerr != nil {
-						errs = multierror.Append(errs, evalerr)
+						appendErr(evalerr)
 						continue
 					}
 					if !ok {
@@ -541,7 +577,7 @@ func (s *svc) functions(ctx context.Context, tracked event.TrackedEvent) error {
 						"error", err,
 						"function", copied.Name,
 					)
-					errs = multierror.Append(errs, err)
+					appendErr(err)
 				}
 				return
 			}

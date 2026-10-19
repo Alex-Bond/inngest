@@ -123,11 +123,18 @@ func action(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
+	eventStream, err := eventStreamOpts(cmd, redisURI)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	opts := devserver.StartOpts{
 		Config:                  *conf,
 		ConnectGatewayHost:      conf.CoreAPI.Addr,
 		ConnectGatewayPort:      connectGatewayPort,
 		EventKeys:               eventKeys,
+		EventStream:             eventStream,
 		NoUI:                    localconfig.GetBoolValue(cmd, "no-ui", false),
 		Persist:                 true,
 		PollInterval:            localconfig.GetIntValue(cmd, "poll-interval", devserver.DefaultPollInterval),
