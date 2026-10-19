@@ -5906,9 +5906,10 @@ func (e *executor) AppendAndScheduleBatch(ctx context.Context, fn inngest.Functi
 	}
 
 	switch result.Status {
-	case enums.BatchAppend, enums.BatchItemExists:
+	case enums.BatchAppend:
 		// noop
-	case enums.BatchNew:
+	case enums.BatchNew, enums.BatchItemExists:
+		// A duplicate reports the batch it first joined, which may be unscheduled; scheduling is idempotent.
 		dur, err := time.ParseDuration(fn.EventBatch.Timeout)
 		if err != nil {
 			return err
@@ -5930,13 +5931,15 @@ func (e *executor) AppendAndScheduleBatch(ctx context.Context, fn inngest.Functi
 			return err
 		}
 
-		metrics.IncrBatchScheduledCounter(ctx, metrics.CounterOpt{
-			PkgName: pkgName,
-			Tags: map[string]any{
-				"account_id":  bi.AccountID.String(),
-				"function_id": bi.FunctionID.String(),
-			},
-		})
+		if result.Status == enums.BatchNew {
+			metrics.IncrBatchScheduledCounter(ctx, metrics.CounterOpt{
+				PkgName: pkgName,
+				Tags: map[string]any{
+					"account_id":  bi.AccountID.String(),
+					"function_id": bi.FunctionID.String(),
+				},
+			})
+		}
 	case enums.BatchFull, enums.BatchMaxSize:
 		// start execution immediately
 		if err := e.RetrieveAndScheduleBatch(ctx, fn, batch.ScheduleBatchPayload{
