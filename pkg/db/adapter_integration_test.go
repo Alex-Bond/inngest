@@ -251,6 +251,49 @@ func TestInsertEventRoundTrip(t *testing.T) {
 	assert.Len(t, batch, 2)
 }
 
+// Redelivered events and retried schedules insert the same row again; the
+// inserts must keep a single row.
+func TestInsertEventAndFunctionRunAreIdempotent(t *testing.T) {
+	adapter, cleanup := newTestAdapter(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	q := adapter.Q()
+	now := time.Now().UTC()
+
+	eventID := ulid.Make()
+	for range 3 {
+		require.NoError(t, q.InsertEvent(ctx, db.InsertEventParams{
+			InternalID: eventID,
+			EventID:    "dup-event",
+			EventName:  "test/event",
+			EventData:  `{}`,
+			EventUser:  `{}`,
+			EventTs:    now,
+			ReceivedAt: now,
+		}))
+	}
+	events, err := q.GetEventsByInternalIDs(ctx, []ulid.ULID{eventID})
+	require.NoError(t, err)
+	assert.Len(t, events, 1)
+
+	runID := ulid.Make()
+	for range 3 {
+		require.NoError(t, q.InsertFunctionRun(ctx, db.InsertFunctionRunParams{
+			RunID:           runID,
+			RunStartedAt:    now,
+			FunctionID:      uuid.New(),
+			FunctionVersion: 1,
+			TriggerType:     "event",
+			EventID:         eventID,
+			WorkspaceID:     uuid.New(),
+		}))
+	}
+	runs, err := q.GetFunctionRunsFromEvents(ctx, []ulid.ULID{eventID})
+	require.NoError(t, err)
+	assert.Len(t, runs, 1)
+}
+
 // ---------------------------------------------------------------------------
 // Span insert + query (BLOB-in-JSON regression)
 // ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@ import (
 	"github.com/inngest/inngest/pkg/service"
 	"github.com/inngest/inngest/pkg/telemetry/metrics"
 	itrace "github.com/inngest/inngest/pkg/telemetry/trace"
+	"github.com/inngest/inngest/pkg/util"
 	"github.com/oklog/ulid/v2"
 	"go.opentelemetry.io/otel/propagation"
 )
@@ -117,7 +118,7 @@ func WithSyncLifecycleListeners(l ...execution.SyncLifecycleListener) func(s *sv
 }
 
 func NewService(c config.Config, opts ...Opt) Runner {
-	svc := &svc{config: c, log: logger.StdlibLogger(context.Background())}
+	svc := &svc{config: c, log: logger.StdlibLogger(context.Background()), eventLock: util.NewKeyedMutex()}
 	for _, o := range opts {
 		o(svc)
 	}
@@ -157,6 +158,9 @@ type svc struct {
 	// syncLifecycles are invoked synchronously (inline) whenever an event is
 	// durably created, regardless of whether it later matches a function.
 	syncLifecycles []execution.SyncLifecycleListener
+
+	// eventLock serialises inserts per event so concurrent redeliveries can't both pass NOT EXISTS.
+	eventLock *util.KeyedMutex
 
 	log logger.Logger
 }
@@ -326,10 +330,13 @@ func (s *svc) handleMessage(ctx context.Context, m pubsub.Message) error {
 	}
 
 	// Write the event to our CQRS manager for long-term storage.
+	internalID := tracked.GetInternalID()
+	unlock := s.eventLock.Lock(internalID[:])
 	err = s.cqrs.InsertEvent(
 		ctx,
-		cqrs.ConvertFromEvent(tracked.GetInternalID(), tracked.GetEvent()),
+		cqrs.ConvertFromEvent(internalID, tracked.GetEvent()),
 	)
+	unlock()
 	if err != nil {
 		return err
 	}
