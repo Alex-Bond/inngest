@@ -25,10 +25,10 @@ docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 docker compose up -d --build
 
 for _ in $(seq 1 120); do
-  curl -fs http://localhost:18288/health >/dev/null && break
+  curl -fs http://localhost:18288/health/ready >/dev/null && break
   sleep 1
 done
-curl -fs http://localhost:18288/health >/dev/null
+curl -fs http://localhost:18288/health/ready >/dev/null
 
 bin/eventstream_load app &
 APP_PID=$!

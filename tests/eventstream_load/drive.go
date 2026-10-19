@@ -316,7 +316,7 @@ func containerStartedAt(o driveOpts) (string, error) {
 func waitHealthy(api string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if resp, err := http.Get(api + "/health"); err == nil {
+		if resp, err := http.Get(api + "/health/ready"); err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil

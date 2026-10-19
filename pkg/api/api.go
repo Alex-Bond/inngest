@@ -32,9 +32,9 @@ import (
 const (
 	DefaultAPIPort = 8288
 	HealthPath     = "/health"
-	// LivenessPath always answers 200 so a liveness probe never depends on
-	// the event stream backend.
-	LivenessPath = "/health/live"
+	// ReadinessPath fails while shutting down or while the event stream backend is unreachable;
+	// HealthPath stays always-200 so a liveness probe never depends on the backend.
+	ReadinessPath = "/health/ready"
 
 	// shutdownTimeout lets in-flight requests finish publishing on shutdown.
 	shutdownTimeout = 20 * time.Second
@@ -104,7 +104,7 @@ func NewAPI(o Options) (chi.Router, error) {
 	api.Use(headers.StaticHeadersMiddleware(o.Config.GetServerKind()))
 
 	api.Get(HealthPath, api.HealthCheck)
-	api.Get(LivenessPath, api.LivenessCheck)
+	api.Get(ReadinessPath, api.ReadinessCheck)
 	api.Post("/e/{key}", api.ReceiveEvent)
 	api.Post("/invoke/{slug}", api.Invoke)
 
@@ -174,10 +174,17 @@ func (a API) Stop(ctx context.Context) error {
 	return a.server.Shutdown(ctx)
 }
 
-// HealthCheck is the readiness check: it fails while shutting down or while
-// the event stream backend is unreachable.
 func (a API) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	a.log.Trace("healthcheck")
+	w.Header().Add("Content-Type", "application/json")
+	a.writeResponse(w, apiResponse{
+		StatusCode: http.StatusOK,
+		Message:    "OK",
+	})
+}
+
+// ReadinessCheck fails while shutting down or while the event stream backend is unreachable.
+func (a API) ReadinessCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "application/json")
 	if a.shuttingDown != nil && a.shuttingDown.Load() {
 		a.writeResponse(w, apiResponse{StatusCode: http.StatusServiceUnavailable, Error: "Shutting down"})
@@ -187,14 +194,6 @@ func (a API) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		a.writeResponse(w, apiResponse{StatusCode: http.StatusServiceUnavailable, Error: "Event stream unavailable"})
 		return
 	}
-	a.writeResponse(w, apiResponse{
-		StatusCode: http.StatusOK,
-		Message:    "OK",
-	})
-}
-
-func (a API) LivenessCheck(w http.ResponseWriter, r *http.Request) {
-	w.Header().Add("Content-Type", "application/json")
 	a.writeResponse(w, apiResponse{StatusCode: http.StatusOK, Message: "OK"})
 }
 

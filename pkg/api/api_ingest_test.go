@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/inngest/inngest/pkg/config"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,23 +128,37 @@ func TestReceiveEvent_LimitBetweenElementsIs413(t *testing.T) {
 	require.Empty(t, ing.published)
 }
 
-func TestHealthCheck_Readiness(t *testing.T) {
+func TestHealthAndReadiness(t *testing.T) {
 	ing := &fakeIngester{ready: true}
 	a := API{ingester: ing, log: logger.StdlibLogger(t.Context()), shuttingDown: &atomic.Bool{}}
 
-	check := func(h http.HandlerFunc) int {
+	check := func(h http.HandlerFunc, path string) int {
 		w := httptest.NewRecorder()
-		h(w, httptest.NewRequest(http.MethodGet, HealthPath, nil))
+		h(w, httptest.NewRequest(http.MethodGet, path, nil))
 		return w.Code
 	}
 
-	require.Equal(t, 200, check(a.HealthCheck))
+	require.Equal(t, 200, check(a.HealthCheck, HealthPath))
+	require.Equal(t, 200, check(a.ReadinessCheck, ReadinessPath))
+
+	// An unreachable backend fails readiness only; the liveness answer never depends on it.
 	ing.ready = false
-	require.Equal(t, http.StatusServiceUnavailable, check(a.HealthCheck))
-	require.Equal(t, 200, check(a.LivenessCheck))
+	require.Equal(t, http.StatusServiceUnavailable, check(a.ReadinessCheck, ReadinessPath))
+	require.Equal(t, 200, check(a.HealthCheck, HealthPath))
 
 	ing.ready = true
 	a.shuttingDown.Store(true)
-	require.Equal(t, http.StatusServiceUnavailable, check(a.HealthCheck))
-	require.Equal(t, 200, check(a.LivenessCheck))
+	require.Equal(t, http.StatusServiceUnavailable, check(a.ReadinessCheck, ReadinessPath))
+	require.Equal(t, 200, check(a.HealthCheck, HealthPath))
+}
+
+func TestHealthRoutes(t *testing.T) {
+	a, err := NewAPI(Options{Config: config.Config{}, Logger: logger.StdlibLogger(t.Context())})
+	require.NoError(t, err)
+
+	for path, want := range map[string]int{HealthPath: 200, ReadinessPath: 200} {
+		w := httptest.NewRecorder()
+		a.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		require.Equal(t, want, w.Code, path)
+	}
 }
